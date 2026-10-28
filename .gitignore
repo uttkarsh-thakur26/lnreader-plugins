@@ -19,3 +19,8 @@ broken-sites-report.json
 .agents/
 .claude/
 .cursor/
+
+# local notes, samples and scratch tests
+CLAUDE.md
+samples/
+/test-*
