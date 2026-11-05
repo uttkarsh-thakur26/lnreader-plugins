@@ -1,0 +1,1698 @@
+import { fetchApi, FetchInit } from '@libs/fetch';
+import { Plugin } from '@/types/plugin';
+import { FilterTypes, Filters } from '@libs/filterInputs';
+import { load as loadCheerio } from 'cheerio';
+import { defaultCover } from '@libs/defaultCover';
+import { NovelStatus } from '@libs/novelStatus';
+import { gcm } from '@libs/aes';
+import { storage } from '@libs/storage';
+
+type SerieData = {
+  raw_id: number;
+  slug: string;
+  status: number;
+  chapter_count?: number;
+  genres?: number[];
+  data: {
+    title?: string;
+    author?: string;
+    description?: string;
+    image?: string;
+  };
+};
+
+type ApiChapter = {
+  order: number;
+  title?: string;
+  name?: string;
+  updated_at?: string;
+};
+
+type ChapterContent = {
+  body?: string | string[];
+  glossary_data?: { terms?: string[][] };
+  images?: string[];
+};
+
+type ReaderResponse = {
+  success?: boolean;
+  error?: string;
+  code?: number;
+  message?: string;
+  requireTurnstile?: boolean;
+  content_url?: string;
+  data?: { data?: ChapterContent };
+};
+
+// Chapters past the free range answer AI requests with this code until the
+// user signs in.
+const notLoggedInCode = 1401;
+// How long to stop asking for AI text after a "not logged in" answer, so a
+// signed-out reader does not pay for a failing request on every chapter.
+const aiRetryAfterMs = 10 * 60 * 1000;
+
+const invisibleChars = new RegExp(
+  '[' +
+    [0xad, 0x200b, 0x200c, 0x200d, 0x200e, 0x200f, 0x2060, 0xfeff]
+      .map(code => String.fromCharCode(code))
+      .join('') +
+    ']',
+  'g',
+);
+const glossaryMarker = /(?:wtr-lab\s+)?※(\d+)[⛬〓]/g;
+
+function decodeUtf8(bytes: Uint8Array): string {
+  if (typeof TextDecoder !== 'undefined') {
+    return new TextDecoder().decode(bytes);
+  }
+  let out = '';
+  for (let i = 0; i < bytes.length; ) {
+    const byte = bytes[i++];
+    let code = byte;
+    if (byte >= 0xf0) {
+      code =
+        ((byte & 0x07) << 18) |
+        ((bytes[i++] & 0x3f) << 12) |
+        ((bytes[i++] & 0x3f) << 6) |
+        (bytes[i++] & 0x3f);
+    } else if (byte >= 0xe0) {
+      code =
+        ((byte & 0x0f) << 12) |
+        ((bytes[i++] & 0x3f) << 6) |
+        (bytes[i++] & 0x3f);
+    } else if (byte >= 0xc0) {
+      code = ((byte & 0x1f) << 6) | (bytes[i++] & 0x3f);
+    }
+    out += String.fromCodePoint(code);
+  }
+  return out;
+}
+
+function base64ToBytes(b64: string): Uint8Array {
+  return Uint8Array.from(atob(b64), char => char.charCodeAt(0));
+}
+
+// Titles and descriptions can hide words as %{"word": "base64"} or
+// %{word | base64} tokens; show the decoded word.
+function resolveTokens(text: string | undefined | null): string {
+  if (!text) return '';
+  return text.replace(
+    /%\{(?:"([^"]*)":\s*"?([A-Za-z0-9+/=_-]+)"?|([^|{}%]+?)\s*\|\s*([A-Za-z0-9+/=_-]+))\}/g,
+    (match, safe1, b64a, safe2, b64b) => {
+      const fallback = (safe1 ?? safe2 ?? '').trim();
+      try {
+        const clean = (b64a ?? b64b ?? '')
+          .trim()
+          .replace(/-/g, '+')
+          .replace(/_/g, '/')
+          .replace(/=+$/, '');
+        const padded = clean + '='.repeat((4 - (clean.length % 4)) % 4);
+        return decodeUtf8(base64ToBytes(padded)) || fallback || match;
+      } catch {
+        return fallback || match;
+      }
+    },
+  );
+}
+
+const escapeHtml = (text: string) =>
+  text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+
+class WTRLabCleanPlugin implements Plugin.PluginBase {
+  id = 'wtrlabclean';
+  name = 'WTR-LAB (Clean)';
+  icon = 'src/en/wtrlabclean/icon.png';
+  site = 'https://wtr-lab.com/';
+  version = '1.0.0';
+
+  pluginSettings = {
+    preferredMode: {
+      value: 'ai',
+      label: 'Preferred translation',
+      type: 'Select',
+      options: [
+        {
+          label: 'AI (best, needs sign-in after the first chapters)',
+          value: 'ai',
+        },
+        { label: 'Web (machine translated on the device)', value: 'web' },
+      ],
+    },
+    fallbackToWeb: {
+      value: true,
+      label: 'Use Web translation when AI is not available',
+      type: 'Switch',
+    },
+    signInUrl: {
+      value: '',
+      label:
+        'Sign-in link: on wtr-lab.com choose "Continue with Email", then paste the full link from that email here. It is used once; clear it after chapters load.',
+      type: 'Text',
+    },
+  };
+
+  private buildId = '';
+  private aesKey = '';
+  private aiBlocked = { fromChapter: Infinity, at: 0 };
+  private signInAttempted = false;
+
+  async fetchSite(url: string, init?: FetchInit): Promise<Response> {
+    const response = await fetchApi(url, init);
+    if (response.headers.get('cf-mitigated') === 'challenge') {
+      throw new Error(
+        'WTR-LAB is showing a security check. Open it in WebView, complete the check, then try again.',
+      );
+    }
+    if (!response.ok) {
+      throw new Error(
+        response.status === 404
+          ? 'Not found (404), it may have been removed from WTR-LAB.'
+          : `Could not reach WTR-LAB (${response.status}: ${response.statusText}), try opening it in WebView.`,
+      );
+    }
+    return response;
+  }
+
+  parsePath(path: string) {
+    const match = path.match(
+      /(?:novel\/|serie-)(\d+)\/([^/?#]+)(?:\/chapter-(\d+))?/,
+    );
+    if (!match) throw new Error(`Unrecognised WTR-LAB path: ${path}`);
+    return {
+      rawId: parseInt(match[1], 10),
+      slug: match[2],
+      chapterNo: match[3] ? parseInt(match[3], 10) : 0,
+    };
+  }
+
+  novelPath(rawId: number, slug: string) {
+    return `en/novel/${rawId}/${slug}`;
+  }
+
+  toNovelItem(serie: SerieData): Plugin.NovelItem {
+    return {
+      name: resolveTokens(serie.data?.title) || serie.slug,
+      path: this.novelPath(serie.raw_id, serie.slug),
+      cover: this.absolute(serie.data?.image) || defaultCover,
+    };
+  }
+
+  absolute(url: string | undefined): string | undefined {
+    if (!url) return undefined;
+    if (/^https?:\/\//i.test(url)) return url;
+    if (url.startsWith('//')) return 'https:' + url;
+    return this.site + url.replace(/^\//, '');
+  }
+
+  // The finder's JSON route is keyed by the site's current build; one page
+  // load gives the id, and it is reused until the site deploys a new build.
+  async finderJson(query: string): Promise<{ series?: SerieData[] }> {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      if (!this.buildId) {
+        const html = await this.fetchSite(this.site + 'en/novel-finder').then(
+          res => res.text(),
+        );
+        this.buildId = html.match(/"buildId":"([^"]+)"/)?.[1] || '';
+        if (!this.buildId)
+          throw new Error('Could not read the WTR-LAB build id');
+      }
+      const response = await fetchApi(
+        `${this.site}_next/data/${this.buildId}/en/novel-finder.json?${query}`,
+      );
+      if (response.status === 404 && attempt === 0) {
+        this.buildId = '';
+        continue;
+      }
+      if (!response.ok) {
+        throw new Error(`Could not load the novel list (${response.status})`);
+      }
+      return (await response.json()).pageProps || {};
+    }
+    return {};
+  }
+
+  async popularNovels(
+    pageNo: number,
+    {
+      showLatestNovels,
+      filters,
+    }: Plugin.PopularNovelsOptions<typeof this.filters>,
+  ): Promise<Plugin.NovelItem[]> {
+    if (showLatestNovels) {
+      const recent = await this.fetchSite(this.site + 'api/home/recent', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ page: pageNo }),
+      }).then(res => res.json());
+      return (recent.data || []).map((item: { serie: SerieData }) =>
+        this.toNovelItem(item.serie),
+      );
+    }
+
+    const params = new URLSearchParams();
+    params.append('orderBy', filters.orderBy.value);
+    params.append('order', filters.order.value);
+    params.append('status', filters.status.value);
+    params.append('release_status', filters.release_status.value);
+    params.append('addition_age', filters.addition_age.value);
+    params.append('page', pageNo.toString());
+    if (filters.search.value) params.append('text', filters.search.value);
+    if (filters.genres.value?.include?.length) {
+      params.append('gi', filters.genres.value.include.join(','));
+      params.append('gc', filters.genre_operator.value);
+    }
+    if (filters.genres.value?.exclude?.length) {
+      params.append('ge', filters.genres.value.exclude.join(','));
+    }
+    if (filters.tags.value?.include?.length) {
+      params.append('ti', filters.tags.value.include.join(','));
+      params.append('tc', filters.tag_operator.value);
+    }
+    if (filters.tags.value?.exclude?.length) {
+      params.append('te', filters.tags.value.exclude.join(','));
+    }
+    if (filters.folders.value) params.append('folders', filters.folders.value);
+    if (filters.library_exclude.value) {
+      params.append('le', filters.library_exclude.value);
+    }
+    if (filters.min_chapters.value) {
+      params.append('count_value', filters.min_chapters.value);
+    }
+    if (filters.min_rating.value)
+      params.append('minr', filters.min_rating.value);
+    if (filters.min_review_count.value) {
+      params.append('minrc', filters.min_review_count.value);
+    }
+
+    const { series = [] } = await this.finderJson(params.toString());
+    const seen = new Set<number>();
+    return series
+      .filter(serie => !seen.has(serie.raw_id) && !!seen.add(serie.raw_id))
+      .map(serie => this.toNovelItem(serie));
+  }
+
+  async searchNovels(
+    searchTerm: string,
+    pageNo: number,
+  ): Promise<Plugin.NovelItem[]> {
+    const params = new URLSearchParams({
+      text: searchTerm,
+      page: pageNo.toString(),
+    });
+    const { series = [] } = await this.finderJson(params.toString());
+    return series.map(serie => this.toNovelItem(serie));
+  }
+
+  async parseNovel(novelPath: string): Promise<Plugin.SourceNovel> {
+    const { rawId, slug } = this.parsePath(novelPath);
+    const html = await this.fetchSite(
+      this.site + this.novelPath(rawId, slug),
+    ).then(res => res.text());
+    const nextData = loadCheerio(html)('#__NEXT_DATA__').html();
+    const pageProps = nextData ? JSON.parse(nextData).props?.pageProps : null;
+    const serie: SerieData | undefined = pageProps?.serie?.serie_data;
+    if (!serie) throw new Error('Could not read the novel page');
+
+    const genreNames = new Map(
+      this.filters.genres.options.map(option => [
+        option.value,
+        option.label.replace(/-/g, ' '),
+      ]),
+    );
+    const labels = [
+      ...(serie.genres || []).map(id => genreNames.get(String(id))),
+      ...(pageProps.tags || []).map((tag: { title?: string }) =>
+        resolveTokens(tag.title).trim(),
+      ),
+    ].filter((label): label is string => !!label);
+
+    const novel: Plugin.SourceNovel = {
+      path: novelPath,
+      name: resolveTokens(serie.data.title) || slug,
+      cover: this.absolute(serie.data.image) || defaultCover,
+      author: resolveTokens(serie.data.author),
+      summary: resolveTokens(serie.data.description).trim(),
+      genres: labels
+        .filter((label, i) => labels.indexOf(label) === i)
+        .join(', '),
+      status:
+        serie.status === 0
+          ? NovelStatus.Ongoing
+          : serie.status === 1
+            ? NovelStatus.Completed
+            : NovelStatus.Unknown,
+      chapters: await this.fetchChapters(rawId, slug, serie.chapter_count || 0),
+    };
+    return novel;
+  }
+
+  // One request normally returns the whole list; keep paging only if the
+  // server ever caps the range.
+  async fetchChapters(
+    rawId: number,
+    slug: string,
+    expected: number,
+  ): Promise<Plugin.ChapterItem[]> {
+    const chapters: Plugin.ChapterItem[] = [];
+    let start = 1;
+    for (;;) {
+      const end = start + Math.max(expected, 1000);
+      const data = await this.fetchSite(
+        `${this.site}api/chapters/${rawId}?start=${start}&end=${end}`,
+      ).then(res => res.json());
+      const batch: ApiChapter[] = data.chapters ?? data.data?.chapters ?? [];
+      if (!batch.length) break;
+      for (const chapter of batch) {
+        chapters.push({
+          name:
+            resolveTokens(chapter.title || chapter.name).trim() ||
+            `Chapter ${chapter.order}`,
+          path: `${this.novelPath(rawId, slug)}/chapter-${chapter.order}`,
+          releaseTime: chapter.updated_at?.substring(0, 10),
+          chapterNumber: chapter.order,
+        });
+      }
+      const last = batch[batch.length - 1].order;
+      if (last < start || (expected && last >= expected)) break;
+      start = last + 1;
+    }
+    return chapters.sort(
+      (a, b) => (a.chapterNumber || 0) - (b.chapterNumber || 0),
+    );
+  }
+
+  // Redeems the emailed sign-in link once per app run. The session cookie it
+  // sets lands in the app's shared cookie jar, which later requests reuse.
+  async ensureSignedIn(): Promise<void> {
+    const link = (storage.get<string>('signInUrl') || '').trim();
+    if (!link || this.signInAttempted) return;
+    this.signInAttempted = true;
+    const token =
+      link.match(/[?&]token=([^&\s]+)/)?.[1] ||
+      (/^[A-Za-z0-9_.-]{16,}$/.test(link) ? link : '');
+    if (!token) return;
+    if (
+      /^[a-z]+:\/\//i.test(link) &&
+      !/^https:\/\/([a-z0-9-]+\.)*wtr-lab\.com\//i.test(link)
+    ) {
+      return;
+    }
+    await fetchApi(
+      `${this.site}api/auth/magic-link/verify?token=${encodeURIComponent(
+        decodeURIComponent(token),
+      )}&callbackURL=/`,
+      { headers: { Referer: this.site } },
+    ).catch(() => undefined);
+    this.aiBlocked = { fromChapter: Infinity, at: 0 };
+  }
+
+  modesFor(chapterNo: number): string[] {
+    const preferred = storage.get<string>('preferredMode') || 'ai';
+    const fallback = storage.get<boolean>('fallbackToWeb') !== false;
+    const aiBlocked =
+      chapterNo >= this.aiBlocked.fromChapter &&
+      Date.now() - this.aiBlocked.at < aiRetryAfterMs;
+    if (preferred === 'web') return ['web'];
+    if (aiBlocked && fallback) return ['web'];
+    return fallback ? ['ai', 'web'] : ['ai'];
+  }
+
+  async readChapter(
+    mode: string,
+    rawId: number,
+    chapterNo: number,
+    referer: string,
+  ): Promise<ReaderResponse> {
+    const response = await fetchApi(this.site + 'api/reader/get', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+        'Referer': referer,
+      },
+      body: JSON.stringify({
+        translate: mode,
+        language: 'en',
+        raw_id: rawId,
+        chapter_no: chapterNo,
+        retry: false,
+        force_retry: false,
+      }),
+    });
+    if (response.headers.get('cf-mitigated') === 'challenge') {
+      return { success: false, requireTurnstile: true };
+    }
+    const text = await response.text();
+    try {
+      return JSON.parse(text);
+    } catch {
+      return { success: false, error: `HTTP ${response.status}` };
+    }
+  }
+
+  async chapterContent(reader: ReaderResponse): Promise<ChapterContent | null> {
+    if (reader.data?.data?.body !== undefined) return reader.data.data;
+    if (!reader.content_url) return null;
+    const url = this.absolute(reader.content_url) || '';
+    // content_url comes from the server; only follow it to wtr-lab hosts.
+    if (!/^https:\/\/([a-z0-9-]+\.)*wtr-lab\.com\//i.test(url)) return null;
+    const json = await this.fetchSite(url, {
+      headers: { Accept: 'application/json' },
+    }).then(res => res.json());
+    return json?.data?.data ?? json?.data ?? null;
+  }
+
+  async parseChapter(chapterPath: string): Promise<string> {
+    const { rawId, slug, chapterNo } = this.parsePath(chapterPath);
+    if (!chapterNo)
+      throw new Error(`No chapter number in path: ${chapterPath}`);
+    const referer = `${this.site}${this.novelPath(rawId, slug)}/chapter-${chapterNo}`;
+
+    await this.ensureSignedIn();
+
+    let content: ChapterContent | null = null;
+    let needsLogin = false;
+    let needsCheck = false;
+    for (const mode of this.modesFor(chapterNo)) {
+      const reader = await this.readChapter(mode, rawId, chapterNo, referer);
+      if (reader.requireTurnstile) {
+        needsCheck = true;
+        break;
+      }
+      if (reader.code === notLoggedInCode) {
+        needsLogin = true;
+        if (mode === 'ai') {
+          this.aiBlocked = {
+            fromChapter: Math.min(this.aiBlocked.fromChapter, chapterNo),
+            at: Date.now(),
+          };
+        }
+        continue;
+      }
+      if (reader.success === false) continue;
+      content = await this.chapterContent(reader);
+      if (content?.body !== undefined) break;
+    }
+
+    if (!content || content.body === undefined) {
+      if (needsCheck) {
+        throw new Error(
+          'WTR-LAB wants a quick human check before more chapters. Open this chapter in WebView, complete the check, then reload it.' +
+            (needsLogin
+              ? ' Signing in to WTR-LAB also unlocks AI translation.'
+              : ''),
+        );
+      }
+      if (needsLogin) {
+        throw new Error(
+          'This chapter needs a WTR-LAB sign-in for AI translation. Sign in through WebView or the plugin settings, or turn on the Web fallback.',
+        );
+      }
+      throw new Error('WTR-LAB returned no text for this chapter.');
+    }
+
+    let paragraphs: string[];
+    if (typeof content.body === 'string' && /^(arr|str):/.test(content.body)) {
+      const decrypted = await this.decrypt(content.body, referer);
+      paragraphs = await this.translate(
+        Array.isArray(decrypted) ? decrypted : decrypted.split('\n'),
+      );
+    } else {
+      paragraphs = Array.isArray(content.body)
+        ? content.body
+        : content.body.split('\n');
+    }
+
+    const terms = content.glossary_data?.terms || [];
+    const images = [...(content.images || [])];
+    const html: string[] = [];
+    for (const paragraph of paragraphs) {
+      if (typeof paragraph !== 'string') continue;
+      const parts = paragraph.split(/\[\s*image\s*\]/i);
+      parts.forEach((part, i) => {
+        if (i > 0) {
+          const image = images.shift();
+          if (image)
+            html.push(`<img src="${escapeHtml(this.absolute(image) || '')}">`);
+        }
+        const text = this.cleanText(part, terms);
+        if (text) html.push(`<p>${escapeHtml(text)}</p>`);
+      });
+    }
+    images.forEach(image =>
+      html.push(`<img src="${escapeHtml(this.absolute(image) || '')}">`),
+    );
+    return html.join('\n');
+  }
+
+  cleanText(text: string, terms: string[][]): string {
+    return resolveTokens(text)
+      .replace(
+        glossaryMarker,
+        (marker, index) => terms[Number(index)]?.[0] || '',
+      )
+      .replace(/[※⛬〓]/g, '')
+      .replace(invisibleChars, '')
+      .replace(/\s+/g, ' ')
+      .replace(/\s+([,.!?;:])/g, '$1')
+      .trim();
+  }
+
+  // Web chapters arrive AES-GCM encrypted. The key sits in one of the
+  // reader's script chunks; find it once and keep it until it stops working.
+  async decrypt(
+    encrypted: string,
+    referer: string,
+  ): Promise<string | string[]> {
+    const isArray = encrypted.startsWith('arr:');
+    const parts = encrypted.substring(4).split(':');
+    if (parts.length !== 3)
+      throw new Error('Unexpected encrypted chapter format');
+    const [iv, tag, cipherText] = parts.map(base64ToBytes);
+    const combined = new Uint8Array(cipherText.length + tag.length);
+    combined.set(cipherText);
+    combined.set(tag, cipherText.length);
+
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const key = await this.getKey(referer, attempt > 0);
+      try {
+        const keyBytes = Uint8Array.from(key.slice(0, 32), c =>
+          c.charCodeAt(0),
+        );
+        const plain = decodeUtf8(gcm(keyBytes, iv).decrypt(combined));
+        return isArray ? JSON.parse(plain) : plain;
+      } catch {
+        // A stale key fails authentication; look it up again once.
+      }
+    }
+    throw new Error(
+      'Could not decrypt this chapter, the site may have changed.',
+    );
+  }
+
+  async getKey(referer: string, refresh: boolean): Promise<string> {
+    if (!refresh) {
+      this.aesKey = this.aesKey || storage.get<string>('aesKey') || '';
+      if (this.aesKey) return this.aesKey;
+    }
+    const html = await this.fetchSite(referer).then(res => res.text());
+    // The decryption code is in a deferred reader chunk near the end of the
+    // body (not in <head>), so scan the page's chunks from the end.
+    // Plain arrays only: the ES5 build turns spreads of a Set or iterator
+    // into empty arrays.
+    const chunks = (html.match(/static\/chunks\/[\w.-]+\.js/g) || [])
+      .filter((chunk, i, all) => all.indexOf(chunk) === i)
+      .map(chunk => '_next/' + chunk)
+      .reverse();
+    const keyPattern = /TextEncoder\(\)\.encode\("([^"]{32,})"/;
+    for (let i = 0; i < chunks.length; i += 8) {
+      const found = await Promise.all(
+        chunks.slice(i, i + 8).map(chunk =>
+          fetchApi(this.site + chunk)
+            .then(res => res.text())
+            .then(code => code.match(keyPattern)?.[1])
+            .catch(() => undefined),
+        ),
+      );
+      const key = found.find(Boolean);
+      if (key) {
+        this.aesKey = key.slice(0, 32);
+        storage.set('aesKey', this.aesKey);
+        return this.aesKey;
+      }
+    }
+    throw new Error('Could not find the chapter decryption key.');
+  }
+
+  // Web chapters are raw Chinese; translate them in parallel batches.
+  async translate(lines: string[]): Promise<string[]> {
+    const batches: string[][] = [];
+    let current: string[] = [];
+    let size = 0;
+    for (const line of lines) {
+      if (current.length && size + line.length > 3000) {
+        batches.push(current);
+        current = [];
+        size = 0;
+      }
+      current.push(line);
+      size += line.length;
+    }
+    if (current.length) batches.push(current);
+
+    const translated = await Promise.all(
+      batches.map(async batch => {
+        const response = await fetchApi(
+          'https://translate-pa.googleapis.com/v1/translateHtml',
+          {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json+protobuf',
+              // Public key used by Google's website translation widget.
+              'X-Goog-API-Key': 'AIzaSyATBXajvzQLTDHEQbcpq0Ihe0vWDHmO520',
+            },
+            body: JSON.stringify([
+              [
+                batch.map((line, i) => `<a i=${i}>${escapeHtml(line)}</a>`),
+                'zh-CN',
+                'en',
+              ],
+              'te_lib',
+            ]),
+          },
+        );
+        if (!response.ok) {
+          throw new Error(`Translation failed (${response.status})`);
+        }
+        const result: string[] = (await response.json())?.[0] || [];
+        return batch.map((line, i) =>
+          result[i] ? loadCheerio(result[i]).text() : line,
+        );
+      }),
+    );
+    return translated.flat();
+  }
+
+  resolveUrl = (path: string) => this.site + path;
+
+  filters = {
+    search: {
+      value: '',
+      label: 'Search',
+      type: FilterTypes.TextInput,
+    },
+    orderBy: {
+      value: 'update',
+      label: 'Order by',
+      options: [
+        { label: 'Update Date', value: 'update' },
+        { label: 'Addition Date', value: 'date' },
+        { label: 'Random', value: 'random' },
+        { label: 'Weekly View', value: 'weekly_rank' },
+        { label: 'Monthly View', value: 'monthly_rank' },
+        { label: 'All-Time View', value: 'view' },
+        { label: 'Name', value: 'name' },
+        { label: 'Reader', value: 'reader' },
+        { label: 'Chapter', value: 'chapter' },
+        { label: 'Rating', value: 'rating' },
+        { label: 'Review Count', value: 'total_rate' },
+        { label: 'Vote Count', value: 'vote' },
+      ],
+      type: FilterTypes.Picker,
+    },
+    order: {
+      value: 'desc',
+      label: 'Order',
+      options: [
+        { label: 'Descending', value: 'desc' },
+        { label: 'Ascending', value: 'asc' },
+      ],
+      type: FilterTypes.Picker,
+    },
+    status: {
+      value: 'all',
+      label: 'Status',
+      options: [
+        { label: 'All', value: 'all' },
+        { label: 'Ongoing', value: 'ongoing' },
+        { label: 'Completed', value: 'completed' },
+        { label: 'Hiatus', value: 'hiatus' },
+        { label: 'Dropped', value: 'dropped' },
+      ],
+      type: FilterTypes.Picker,
+    },
+    release_status: {
+      value: 'all',
+      label: 'Release Status',
+      options: [
+        { label: 'All', value: 'all' },
+        { label: 'Released', value: 'released' },
+        { label: 'On Voting', value: 'voting' },
+      ],
+      type: FilterTypes.Picker,
+    },
+    addition_age: {
+      value: 'all',
+      label: 'Addition Age',
+      options: [
+        { label: 'All', value: 'all' },
+        { label: '< 2 Days', value: 'day' },
+        { label: '< 1 Week', value: 'week' },
+        { label: '< 1 Month', value: 'month' },
+      ],
+      type: FilterTypes.Picker,
+    },
+    min_chapters: {
+      value: '',
+      label: 'Minimum Chapters',
+      type: FilterTypes.TextInput,
+    },
+    min_rating: {
+      value: '',
+      label: 'Minimum Rating (0.0-5.0)',
+      type: FilterTypes.TextInput,
+    },
+    min_review_count: {
+      value: '',
+      label: 'Minimum Review Count',
+      type: FilterTypes.TextInput,
+    },
+    genre_operator: {
+      value: 'and',
+      label: 'Genre (And/Or)',
+      options: [
+        { label: 'And', value: 'and' },
+        { label: 'Or', value: 'or' },
+      ],
+      type: FilterTypes.Picker,
+    },
+    genres: {
+      label: 'Genres',
+      type: FilterTypes.ExcludableCheckboxGroup,
+      value: { include: [], exclude: [] },
+      options: [
+        { label: 'Action', value: '1' },
+        { label: 'Adult', value: '2' },
+        { label: 'Adventure', value: '3' },
+        { label: 'Comedy', value: '4' },
+        { label: 'Drama', value: '5' },
+        { label: 'Ecchi', value: '6' },
+        { label: 'Erciyuan', value: '7' },
+        { label: 'Fan-Fiction', value: '8' },
+        { label: 'Fantasy', value: '9' },
+        { label: 'Game', value: '10' },
+        { label: 'Gender-Bender', value: '11' },
+        { label: 'Harem', value: '12' },
+        { label: 'Historical', value: '13' },
+        { label: 'Horror', value: '14' },
+        { label: 'Josei', value: '15' },
+        { label: 'Martial-Arts', value: '16' },
+        { label: 'Mature', value: '17' },
+        { label: 'Mecha', value: '18' },
+        { label: 'Military', value: '19' },
+        { label: 'Mystery', value: '20' },
+        { label: 'Psychological', value: '21' },
+        { label: 'Romance', value: '22' },
+        { label: 'School-Life', value: '23' },
+        { label: 'Sci-Fi', value: '24' },
+        { label: 'Seinen', value: '25' },
+        { label: 'Shoujo', value: '26' },
+        { label: 'Shoujo-Ai', value: '27' },
+        { label: 'Shounen', value: '28' },
+        { label: 'Shounen-Ai', value: '29' },
+        { label: 'Slice-Of-Life', value: '30' },
+        { label: 'Smut', value: '31' },
+        { label: 'Sports', value: '32' },
+        { label: 'Supernatural', value: '33' },
+        { label: 'Tragedy', value: '34' },
+        { label: 'Urban-Life', value: '35' },
+        { label: 'Wuxia', value: '36' },
+        { label: 'Xianxia', value: '37' },
+        { label: 'Xuanhuan', value: '38' },
+        { label: 'Yaoi', value: '39' },
+        { label: 'Yuri', value: '40' },
+      ],
+    },
+    tag_operator: {
+      value: 'and',
+      label: 'Tag (And/Or)',
+      options: [
+        { label: 'And', value: 'and' },
+        { label: 'Or', value: 'or' },
+      ],
+      type: FilterTypes.Picker,
+    },
+
+    tags: {
+      label: 'Tags',
+      type: FilterTypes.ExcludableCheckboxGroup,
+      value: {
+        include: [],
+        exclude: [],
+      },
+      options: [
+        { label: 'Abandoned Children', value: '1' },
+        { label: 'Ability Steal', value: '2' },
+        { label: 'Absent Parents', value: '3' },
+        { label: 'Abusive Characters', value: '4' },
+        { label: 'Academy', value: '5' },
+        { label: 'Accelerated Growth', value: '6' },
+        { label: 'Acting', value: '7' },
+        { label: 'Adapted from Manga', value: '8' },
+        { label: 'Adapted from Manhua', value: '9' },
+        { label: 'Adapted to Anime', value: '10' },
+        { label: 'Adapted to Drama', value: '11' },
+        { label: 'Adapted to Drama CD', value: '12' },
+        { label: 'Adapted to Game', value: '13' },
+        { label: 'Adapted to Manga', value: '14' },
+        { label: 'Adapted to Manhua', value: '15' },
+        { label: 'Adapted to Manhwa', value: '16' },
+        { label: 'Adapted to Movie', value: '17' },
+        { label: 'Adapted to Visual Novel', value: '18' },
+        { label: 'Adopted Children', value: '19' },
+        { label: 'Adopted Protagonist', value: '20' },
+        { label: 'Adultery', value: '21' },
+        { label: 'Adventurers', value: '22' },
+        { label: 'Affair', value: '23' },
+        { label: 'Age Progression', value: '24' },
+        { label: 'Age Regression', value: '25' },
+        { label: 'Aggressive Characters', value: '26' },
+        { label: 'Alchemy', value: '27' },
+        { label: 'Aliens', value: '28' },
+        { label: 'All-Girls School', value: '29' },
+        { label: 'Alternate World', value: '30' },
+        { label: 'Amnesia', value: '31' },
+        { label: 'Amusement Park', value: '32' },
+        { label: 'Anal', value: '33' },
+        { label: 'Ancient China', value: '34' },
+        { label: 'Ancient Times', value: '35' },
+        { label: 'Androgynous Characters', value: '36' },
+        { label: 'Androids', value: '37' },
+        { label: 'Angels', value: '38' },
+        { label: 'Animal Characteristics', value: '39' },
+        { label: 'Animal Rearing', value: '40' },
+        { label: 'Anti-Magic', value: '41' },
+        { label: 'Anti-social Protagonist', value: '42' },
+        { label: 'Antihero Protagonist', value: '43' },
+        { label: 'Antique Shop', value: '44' },
+        { label: 'Apartment Life', value: '45' },
+        { label: 'Apathetic Protagonist', value: '46' },
+        { label: 'Apocalypse', value: '47' },
+        { label: 'Appearance Changes', value: '48' },
+        { label: 'Appearance Different from Actual Age', value: '49' },
+        { label: 'Archery', value: '50' },
+        { label: 'Aristocracy', value: '51' },
+        { label: 'Arms Dealers', value: '52' },
+        { label: 'Army', value: '53' },
+        { label: 'Army Building', value: '54' },
+        { label: 'Arranged Marriage', value: '55' },
+        { label: 'Array', value: '822' },
+        { label: 'Arrogant Characters', value: '56' },
+        { label: 'Artifact Crafting', value: '57' },
+        { label: 'Artifacts', value: '58' },
+        { label: 'Artificial Intelligence', value: '59' },
+        { label: 'Artists', value: '60' },
+        { label: 'Assassins', value: '61' },
+        { label: 'Astrologers', value: '62' },
+        { label: 'Autism', value: '63' },
+        { label: 'Automatons', value: '64' },
+        { label: 'Average-looking Protagonist', value: '65' },
+        { label: 'Award-winning Work', value: '66' },
+        { label: 'Awkward Protagonist', value: '67' },
+        { label: 'Bands', value: '68' },
+        { label: 'Based on a Movie', value: '69' },
+        { label: 'Based on a Song', value: '70' },
+        { label: 'Based on a TV Show', value: '71' },
+        { label: 'Based on a Video Game', value: '72' },
+        { label: 'Based on a Visual Novel', value: '73' },
+        { label: 'Based on an Anime', value: '74' },
+        { label: 'Basketball', value: '809' },
+        { label: 'Battle Academy', value: '75' },
+        { label: 'Battle Competition', value: '76' },
+        { label: 'BDSM', value: '77' },
+        { label: 'Beast Companions', value: '78' },
+        { label: 'Beastkin', value: '79' },
+        { label: 'Beasts', value: '80' },
+        { label: 'Beautiful Female Lead', value: '81' },
+        { label: 'Bestiality', value: '82' },
+        { label: 'Betrayal', value: '83' },
+        { label: 'Bickering Couple', value: '84' },
+        { label: 'Biochip', value: '85' },
+        { label: 'Bisexual Protagonist', value: '86' },
+        { label: 'Black Belly', value: '87' },
+        { label: 'Blackmail', value: '88' },
+        { label: 'Blacksmith', value: '89' },
+        { label: 'Bleach', value: '770' },
+        { label: 'Blind Dates', value: '90' },
+        { label: 'Blind Protagonist', value: '91' },
+        { label: 'Blood Manipulation', value: '92' },
+        { label: 'Bloodlines', value: '93' },
+        { label: 'Body Swap', value: '94' },
+        { label: 'Body Tempering', value: '95' },
+        { label: 'Body-double', value: '96' },
+        { label: 'Bodyguards', value: '97' },
+        { label: 'Books', value: '98' },
+        { label: 'Bookworm', value: '99' },
+        { label: 'Boss-Subordinate Relationship', value: '100' },
+        { label: 'Brainwashing', value: '101' },
+        { label: 'Breast Fetish', value: '102' },
+        { label: 'Broken Engagement', value: '103' },
+        { label: 'Brother Complex', value: '104' },
+        { label: 'Brotherhood', value: '105' },
+        { label: 'Buddhism', value: '106' },
+        { label: 'Bullying', value: '107' },
+        { label: 'Business Management', value: '108' },
+        { label: 'Business Wars', value: '806' },
+        { label: 'Businessmen', value: '109' },
+        { label: 'Butlers', value: '110' },
+        { label: 'Calm Protagonist', value: '111' },
+        { label: 'Cannibalism', value: '112' },
+        { label: 'Card Games', value: '113' },
+        { label: 'Carefree Protagonist', value: '114' },
+        { label: 'Caring Protagonist', value: '115' },
+        { label: 'Cautious Protagonist', value: '116' },
+        { label: 'Celebrities', value: '117' },
+        { label: 'Character Growth', value: '118' },
+        { label: 'Charismatic Protagonist', value: '119' },
+        { label: 'Charming Protagonist', value: '120' },
+        { label: 'Chat Rooms', value: '121' },
+        { label: 'Cheats', value: '122' },
+        { label: 'Chefs', value: '123' },
+        { label: 'Child Abuse', value: '124' },
+        { label: 'Child Protagonist', value: '125' },
+        { label: 'Childcare', value: '126' },
+        { label: 'Childhood Friends', value: '127' },
+        { label: 'Childhood Love', value: '128' },
+        { label: 'Childhood Promise', value: '129' },
+        { label: 'Childish Protagonist', value: '130' },
+        { label: 'Chuunibyou', value: '131' },
+        { label: 'Clan Building', value: '132' },
+        { label: 'Class Awakening', value: '827' },
+        { label: 'Classic', value: '133' },
+        { label: 'Clever Protagonist', value: '134' },
+        { label: 'Clingy Lover', value: '135' },
+        { label: 'Clones', value: '136' },
+        { label: 'Clubs', value: '137' },
+        { label: 'Clumsy Love Interests', value: '138' },
+        { label: 'Co-Workers', value: '139' },
+        { label: 'Cohabitation', value: '140' },
+        { label: 'Cold Love Interests', value: '141' },
+        { label: 'Cold Protagonist', value: '142' },
+        { label: 'Collection of Short Stories', value: '143' },
+        { label: 'College/University', value: '144' },
+        { label: 'Coma', value: '145' },
+        { label: 'Comedic Undertone', value: '146' },
+        { label: 'Coming of Age', value: '147' },
+        { label: 'Complex Family Relationships', value: '148' },
+        { label: 'Conditional Power', value: '149' },
+        { label: 'Conferred Gods', value: '800' },
+        { label: 'Confident Protagonist', value: '150' },
+        { label: 'Confinement', value: '151' },
+        { label: 'Conflicting Loyalties', value: '152' },
+        { label: 'Contracts', value: '153' },
+        { label: 'Cooking', value: '154' },
+        { label: 'Copy', value: '807' },
+        { label: 'Corruption', value: '155' },
+        { label: 'Cosmic Wars', value: '156' },
+        { label: 'Cosplay', value: '157' },
+        { label: 'Couple Growth', value: '158' },
+        { label: 'Court Official', value: '159' },
+        { label: 'Cousins', value: '160' },
+        { label: 'Cowardly Protagonist', value: '161' },
+        { label: 'Crafting', value: '162' },
+        { label: 'Crime', value: '163' },
+        { label: 'Criminals', value: '164' },
+        { label: 'Cross-dressing', value: '165' },
+        { label: 'Crossover', value: '166' },
+        { label: 'Cruel Characters', value: '167' },
+        { label: 'Cryostasis', value: '168' },
+        { label: 'Cultivation', value: '169' },
+        { label: 'Cunnilingus', value: '170' },
+        { label: 'Cunning Protagonist', value: '171' },
+        { label: 'Curious Protagonist', value: '172' },
+        { label: 'Curses', value: '173' },
+        { label: 'Cute Children', value: '174' },
+        { label: 'Cute Protagonist', value: '175' },
+        { label: 'Cute Story', value: '176' },
+        { label: 'Cyberpunk 2077', value: '783' },
+        { label: 'Dancers', value: '177' },
+        { label: 'Dao Companion', value: '178' },
+        { label: 'Dao Comprehension', value: '179' },
+        { label: 'Daoism', value: '180' },
+        { label: 'Dark', value: '181' },
+        { label: 'Dark Fantasy', value: '789' },
+        { label: 'DC Universe', value: '778' },
+        { label: 'Dead Protagonist', value: '182' },
+        { label: 'Death', value: '183' },
+        { label: 'Death of Loved Ones', value: '184' },
+        { label: 'Debts', value: '185' },
+        { label: 'Delinquents', value: '186' },
+        { label: 'Delusions', value: '187' },
+        { label: 'Demi-Humans', value: '188' },
+        { label: 'Demon Lord', value: '189' },
+        { label: 'Demon Slayer', value: '812' },
+        { label: 'Demonic Cultivation Technique', value: '190' },
+        { label: 'Demons', value: '191' },
+        { label: 'Dense Protagonist', value: '192' },
+        { label: 'Depictions of Cruelty', value: '193' },
+        { label: 'Depression', value: '194' },
+        { label: 'Destiny', value: '195' },
+        { label: 'Detective Conan', value: '804' },
+        { label: 'Detectives', value: '196' },
+        { label: 'Determined Protagonist', value: '197' },
+        { label: 'Devoted Love Interests', value: '198' },
+        { label: 'Devouring', value: '797' },
+        { label: 'Different Social Status', value: '199' },
+        { label: 'Disabilities', value: '200' },
+        { label: 'Discrimination', value: '201' },
+        { label: 'Disfigurement', value: '202' },
+        { label: 'Dishonest Protagonist', value: '203' },
+        { label: 'Distrustful Protagonist', value: '204' },
+        { label: 'Divination', value: '205' },
+        { label: 'Divine Protection', value: '206' },
+        { label: 'Divorce', value: '207' },
+        { label: 'DnD', value: '794' },
+        { label: 'Doctors', value: '208' },
+        { label: 'Dolls/Puppets', value: '209' },
+        { label: 'Domestic Affairs', value: '210' },
+        { label: 'Doting Love Interests', value: '211' },
+        { label: 'Doting Older Siblings', value: '212' },
+        { label: 'Doting Parents', value: '213' },
+        { label: 'Douluo Dalu', value: '772' },
+        { label: 'Dragon Ball', value: '773' },
+        { label: 'Dragon Riders', value: '214' },
+        { label: 'Dragon Slayers', value: '215' },
+        { label: 'Dragons', value: '216' },
+        { label: 'Dreams', value: '217' },
+        { label: 'Drugs', value: '218' },
+        { label: 'Druids', value: '219' },
+        { label: 'Dungeon Master', value: '220' },
+        { label: 'Dungeons', value: '221' },
+        { label: 'Dwarfs', value: '222' },
+        { label: 'Dystopia', value: '223' },
+        { label: 'e-Sports', value: '224' },
+        { label: 'Early Romance', value: '225' },
+        { label: 'Earth Invasion', value: '226' },
+        { label: 'Easy Going Life', value: '227' },
+        { label: 'Eavesdropping', value: '798' },
+        { label: 'Economics', value: '228' },
+        { label: 'Editors', value: '229' },
+        { label: 'Eidetic Memory', value: '230' },
+        { label: 'Elderly Protagonist', value: '231' },
+        { label: 'Elemental Magic', value: '232' },
+        { label: 'Elves', value: '233' },
+        { label: 'Emotionally Weak Protagonist', value: '234' },
+        { label: 'Empires', value: '235' },
+        { label: 'Enemies Become Allies', value: '236' },
+        { label: 'Enemies Become Lovers', value: '237' },
+        { label: 'Engagement', value: '238' },
+        { label: 'Engineer', value: '239' },
+        { label: 'Enlightenment', value: '240' },
+        { label: 'Episodic', value: '241' },
+        { label: 'Eunuch', value: '242' },
+        { label: 'European Ambience', value: '243' },
+        { label: 'Evil Gods', value: '244' },
+        { label: 'Evil Organizations', value: '245' },
+        { label: 'Evil Protagonist', value: '246' },
+        { label: 'Evil Religions', value: '247' },
+        { label: 'Evolution', value: '248' },
+        { label: 'Exhibitionism', value: '249' },
+        { label: 'Exorcism', value: '250' },
+        { label: 'Eye Powers', value: '251' },
+        { label: 'Fairies', value: '252' },
+        { label: 'Fairy Tail', value: '814' },
+        { label: 'Faith Dependent Deities', value: '808' },
+        { label: 'Fallen Angels', value: '253' },
+        { label: 'Fallen Nobility', value: '254' },
+        { label: 'Familial Love', value: '255' },
+        { label: 'Familiars', value: '256' },
+        { label: 'Family', value: '257' },
+        { label: 'Family Business', value: '258' },
+        { label: 'Family Conflict', value: '259' },
+        { label: 'Famous Parents', value: '260' },
+        { label: 'Famous Protagonist', value: '261' },
+        { label: 'Fanaticism', value: '262' },
+        { label: 'Fanfiction', value: '263' },
+        { label: 'Fantasy Creatures', value: '264' },
+        { label: 'Fantasy World', value: '265' },
+        { label: 'Farming', value: '266' },
+        { label: 'Fast Cultivation', value: '267' },
+        { label: 'Fast Learner', value: '268' },
+        { label: 'Fat Protagonist', value: '269' },
+        { label: 'Fat to Fit', value: '270' },
+        { label: 'Fated Lovers', value: '271' },
+        { label: 'Fearless Protagonist', value: '272' },
+        { label: 'Fellatio', value: '273' },
+        { label: 'Female Master', value: '274' },
+        { label: 'Female Protagonist', value: '275' },
+        { label: 'Female to Male', value: '276' },
+        { label: 'Feng Shui', value: '277' },
+        { label: 'Firearms', value: '278' },
+        { label: 'First Love', value: '279' },
+        { label: 'First-time Intercourse', value: '280' },
+        { label: 'Flashbacks', value: '281' },
+        { label: 'Fleet Battles', value: '282' },
+        { label: 'Folklore', value: '283' },
+        { label: 'Football', value: '780' },
+        { label: 'Forced into a Relationship', value: '284' },
+        { label: 'Forced Living Arrangements', value: '285' },
+        { label: 'Forced Marriage', value: '286' },
+        { label: 'Forgetful Protagonist', value: '287' },
+        { label: 'Former Hero', value: '288' },
+        { label: 'Fox Spirits', value: '289' },
+        { label: 'Friends Become Enemies', value: '290' },
+        { label: 'Friendship', value: '291' },
+        { label: 'Frieren', value: '816' },
+        { label: 'Fujoshi', value: '292' },
+        { label: 'Futanari', value: '293' },
+        { label: 'Futuristic Setting', value: '294' },
+        { label: 'Galge', value: '295' },
+        { label: 'Gambling', value: '296' },
+        { label: 'Game Creator', value: '784' },
+        { label: 'Game Elements', value: '297' },
+        { label: 'Game of Thrones', value: '813' },
+        { label: 'Game Ranking System', value: '298' },
+        { label: 'Gamers', value: '299' },
+        { label: 'Gangs', value: '300' },
+        { label: 'Gao Wu', value: '781' },
+        { label: 'Gate to Another World', value: '301' },
+        { label: 'Genderless Protagonist', value: '302' },
+        { label: 'Generals', value: '303' },
+        { label: 'Genetic Modifications', value: '304' },
+        { label: 'Genies', value: '305' },
+        { label: 'Genius Protagonist', value: '306' },
+        { label: 'Genshin Impact', value: '815' },
+        { label: 'Ghosts', value: '307' },
+        { label: 'Gladiators', value: '308' },
+        { label: 'Glasses-wearing Love Interests', value: '309' },
+        { label: 'Glasses-wearing Protagonist', value: '310' },
+        { label: 'Goblins', value: '311' },
+        { label: 'God Protagonist', value: '312' },
+        { label: 'God-human Relationship', value: '313' },
+        { label: 'Goddesses', value: '314' },
+        { label: 'Godly Powers', value: '315' },
+        { label: 'Gods', value: '316' },
+        { label: 'Golems', value: '317' },
+        { label: 'Gore', value: '318' },
+        { label: 'Grave Keepers', value: '319' },
+        { label: 'Grinding', value: '320' },
+        { label: 'Guardian Relationship', value: '321' },
+        { label: 'Guilds', value: '322' },
+        { label: 'Gunfighters', value: '323' },
+        { label: 'Hackers', value: '324' },
+        { label: 'Half-human Protagonist', value: '325' },
+        { label: 'Handjob', value: '326' },
+        { label: 'Handsome Male Lead', value: '327' },
+        { label: 'Hard-Working Protagonist', value: '328' },
+        { label: 'Harem-seeking Protagonist', value: '329' },
+        { label: 'Harry Potter', value: '768' },
+        { label: 'Harsh Training', value: '330' },
+        { label: 'Hated Protagonist', value: '331' },
+        { label: 'Healers', value: '332' },
+        { label: 'Heartwarming', value: '333' },
+        { label: 'Heaven', value: '334' },
+        { label: 'Heavenly Defying Comprehension', value: '803' },
+        { label: 'Heavenly Tribulation', value: '335' },
+        { label: 'Hell', value: '336' },
+        { label: 'Helpful Protagonist', value: '337' },
+        { label: 'Herbalist', value: '338' },
+        { label: 'Heroes', value: '339' },
+        { label: 'Heterochromia', value: '340' },
+        { label: 'Hidden Abilities', value: '341' },
+        { label: 'Hiding True Abilities', value: '342' },
+        { label: 'Hiding True Identity', value: '343' },
+        { label: 'Hikikomori', value: '344' },
+        { label: 'Hollywood', value: '779' },
+        { label: 'Homunculus', value: '345' },
+        { label: 'Honest Protagonist', value: '346' },
+        { label: 'Hong Kong', value: '821' },
+        { label: 'Honghuang', value: '801' },
+        { label: 'Honkai', value: '818' },
+        { label: 'Hospital', value: '347' },
+        { label: 'Hot-blooded Protagonist', value: '348' },
+        { label: 'Human Experimentation', value: '349' },
+        { label: 'Human Weapon', value: '350' },
+        { label: 'Human-Nonhuman Relationship', value: '351' },
+        { label: 'Humanoid Protagonist', value: '352' },
+        { label: 'Hunter x Hunter', value: '777' },
+        { label: 'Hunters', value: '353' },
+        { label: 'Hypnotism', value: '354' },
+        { label: 'Identity Crisis', value: '355' },
+        { label: 'Imaginary Friend', value: '356' },
+        { label: 'Immortals', value: '357' },
+        { label: 'Imperial Harem', value: '358' },
+        { label: 'Incest', value: '359' },
+        { label: 'Incubus', value: '360' },
+        { label: 'Indecisive Protagonist', value: '361' },
+        { label: 'Industrialization', value: '362' },
+        { label: 'Inferiority Complex', value: '363' },
+        { label: 'Inheritance', value: '364' },
+        { label: 'Inscriptions', value: '365' },
+        { label: 'Insects', value: '366' },
+        { label: 'Interconnected Storylines', value: '367' },
+        { label: 'Interdimensional Travel', value: '368' },
+        { label: 'Introverted Protagonist', value: '369' },
+        { label: 'Investigations', value: '370' },
+        { label: 'Invisibility', value: '371' },
+        { label: 'Jack of All Trades', value: '372' },
+        { label: 'Jealousy', value: '373' },
+        { label: 'Jiangshi', value: '374' },
+        { label: 'Jobless Class', value: '375' },
+        { label: 'Journey to the West', value: '796' },
+        { label: 'JSDF', value: '376' },
+        { label: 'Jujutsu Kaisen', value: '776' },
+        { label: 'Kidnappings', value: '377' },
+        { label: 'Kimetsu no Yaiba', value: '805' },
+        { label: 'Kind Love Interests', value: '378' },
+        { label: 'Kingdom Building', value: '379' },
+        { label: 'Kingdoms', value: '380' },
+        { label: 'Knights', value: '381' },
+        { label: 'Kuudere', value: '382' },
+        { label: 'Lack of Common Sense', value: '383' },
+        { label: 'Language Barrier', value: '384' },
+        { label: 'Late Romance', value: '385' },
+        { label: 'Lawyers', value: '386' },
+        { label: 'Lazy Protagonist', value: '387' },
+        { label: 'Leadership', value: '388' },
+        { label: 'League of Legends', value: '791' },
+        { label: 'Legends', value: '389' },
+        { label: 'Level System', value: '390' },
+        { label: 'Library', value: '391' },
+        { label: 'Life Script', value: '824' },
+        { label: 'Limited Lifespan', value: '392' },
+        { label: 'Live Streaming', value: '782' },
+        { label: 'Living Abroad', value: '393' },
+        { label: 'Living Alone', value: '394' },
+        { label: 'Loli', value: '395' },
+        { label: 'Loneliness', value: '396' },
+        { label: 'Loner Protagonist', value: '397' },
+        { label: 'Long Separations', value: '398' },
+        { label: 'Long-distance Relationship', value: '399' },
+        { label: 'Lord', value: '823' },
+        { label: 'Lord of the Mysteries', value: '799' },
+        { label: 'Lost Civilizations', value: '400' },
+        { label: 'Lottery', value: '401' },
+        { label: 'Love at First Sight', value: '402' },
+        { label: 'Love Interest Falls in Love First', value: '403' },
+        { label: 'Love Rivals', value: '404' },
+        { label: 'Love Triangles', value: '405' },
+        { label: 'Lovers Reunited', value: '406' },
+        { label: 'Low-key Protagonist', value: '407' },
+        { label: 'Loyal Subordinates', value: '408' },
+        { label: 'Lucky Protagonist', value: '409' },
+        { label: 'Magic', value: '410' },
+        { label: 'Magic Beasts', value: '411' },
+        { label: 'Magic Formations', value: '412' },
+        { label: 'Magical Girls', value: '413' },
+        { label: 'Magical Space', value: '414' },
+        { label: 'Magical Technology', value: '415' },
+        { label: 'Maids', value: '416' },
+        { label: 'Male Protagonist', value: '417' },
+        { label: 'Male to Female', value: '418' },
+        { label: 'Male Yandere', value: '419' },
+        { label: 'Management', value: '420' },
+        { label: 'Mangaka', value: '421' },
+        { label: 'Manipulative Characters', value: '422' },
+        { label: 'Manly Gay Couple', value: '423' },
+        { label: 'Marriage', value: '424' },
+        { label: 'Marriage of Convenience', value: '425' },
+        { label: 'Martial Spirits', value: '426' },
+        { label: 'Marvel', value: '766' },
+        { label: 'Masochistic Characters', value: '427' },
+        { label: 'Master-Disciple Relationship', value: '428' },
+        { label: 'Master-Servant Relationship', value: '429' },
+        { label: 'Masturbation', value: '430' },
+        { label: 'Matriarchy', value: '431' },
+        { label: 'Mature Protagonist', value: '432' },
+        { label: 'Medical Knowledge', value: '433' },
+        { label: 'Medieval', value: '434' },
+        { label: 'Mercenaries', value: '435' },
+        { label: 'Merchants', value: '436' },
+        { label: 'Military', value: '437' },
+        { label: 'Mind Break', value: '438' },
+        { label: 'Mind Control', value: '439' },
+        { label: 'Minecraft', value: '790' },
+        { label: 'Misandry', value: '440' },
+        { label: 'Mismatched Couple', value: '441' },
+        { label: 'Misunderstandings', value: '442' },
+        { label: 'MMORPG', value: '443' },
+        { label: 'Mob Protagonist', value: '444' },
+        { label: 'Models', value: '445' },
+        { label: 'Modern Day', value: '446' },
+        { label: 'Modern Knowledge', value: '447' },
+        { label: 'Money Grubber', value: '448' },
+        { label: 'Monster Girls', value: '449' },
+        { label: 'Monster Society', value: '450' },
+        { label: 'Monster Tamer', value: '451' },
+        { label: 'Monsters', value: '452' },
+        { label: 'More Children More Blessings', value: '825' },
+        { label: 'Mortal Flow', value: '792' },
+        { label: 'Movies', value: '453' },
+        { label: 'Mpreg', value: '454' },
+        { label: 'Multiple Identities', value: '455' },
+        { label: 'Multiple Personalities', value: '456' },
+        { label: 'Multiple POV', value: '457' },
+        { label: 'Multiple Protagonists', value: '458' },
+        { label: 'Multiple Realms', value: '459' },
+        { label: 'Multiple Reincarnated Individuals', value: '460' },
+        { label: 'Multiple Timelines', value: '461' },
+        { label: 'Multiple Transported Individuals', value: '462' },
+        { label: 'Murders', value: '463' },
+        { label: 'Music', value: '464' },
+        { label: 'Mutated Creatures', value: '465' },
+        { label: 'Mutations', value: '466' },
+        { label: 'Mute Character', value: '467' },
+        { label: 'Mysterious Family Background', value: '468' },
+        { label: 'Mysterious Illness', value: '469' },
+        { label: 'Mysterious Past', value: '470' },
+        { label: 'Mystery Solving', value: '471' },
+        { label: 'Mythical Beasts', value: '472' },
+        { label: 'Mythology', value: '473' },
+        { label: 'Naive Protagonist', value: '474' },
+        { label: 'Narcissistic Protagonist', value: '475' },
+        { label: 'Naruto', value: '769' },
+        { label: 'Nationalism', value: '476' },
+        { label: 'Near-Death Experience', value: '477' },
+        { label: 'Necromancer', value: '478' },
+        { label: 'Neet', value: '479' },
+        { label: 'Netorare', value: '480' },
+        { label: 'Netorase', value: '481' },
+        { label: 'Netori', value: '482' },
+        { label: 'Nightmares', value: '483' },
+        { label: 'Ninjas', value: '484' },
+        { label: 'Nobles', value: '485' },
+        { label: 'Non-humanoid Protagonist', value: '486' },
+        { label: 'Non-linear Storytelling', value: '487' },
+        { label: 'Nudity', value: '488' },
+        { label: 'Nurses', value: '489' },
+        { label: 'Obsessive Love', value: '490' },
+        { label: 'Office Romance', value: '491' },
+        { label: 'Older Love Interests', value: '492' },
+        { label: 'Omegaverse', value: '493' },
+        { label: 'One Piece', value: '767' },
+        { label: 'Oneshot', value: '494' },
+        { label: 'Online Romance', value: '495' },
+        { label: 'Onmyouji', value: '496' },
+        { label: 'Orcs', value: '497' },
+        { label: 'Organized Crime', value: '498' },
+        { label: 'Orgy', value: '499' },
+        { label: 'Orphans', value: '500' },
+        { label: 'Otaku', value: '501' },
+        { label: 'Otome Game', value: '502' },
+        { label: 'Outcasts', value: '503' },
+        { label: 'Outdoor Intercourse', value: '504' },
+        { label: 'Outer Space', value: '505' },
+        { label: 'Overlord', value: '826' },
+        { label: 'Overpowered Protagonist', value: '506' },
+        { label: 'Overprotective Siblings', value: '507' },
+        { label: 'Pacifist Protagonist', value: '508' },
+        { label: 'Paizuri', value: '509' },
+        { label: 'Parallel Worlds', value: '510' },
+        { label: 'Parasites', value: '511' },
+        { label: 'Parent Complex', value: '512' },
+        { label: 'Parody', value: '513' },
+        { label: 'Part-Time Job', value: '514' },
+        { label: 'Past Plays a Big Role', value: '515' },
+        { label: 'Past Trauma', value: '516' },
+        { label: 'Persistent Love Interests', value: '517' },
+        { label: 'Personality Changes', value: '518' },
+        { label: 'Perverted Protagonist', value: '519' },
+        { label: 'Pets', value: '520' },
+        { label: 'Pharmacist', value: '521' },
+        { label: 'Philosophical', value: '522' },
+        { label: 'Phobias', value: '523' },
+        { label: 'Phoenixes', value: '524' },
+        { label: 'Photography', value: '525' },
+        { label: 'Pill Based Cultivation', value: '526' },
+        { label: 'Pill Concocting', value: '527' },
+        { label: 'Pilots', value: '528' },
+        { label: 'Pirates', value: '529' },
+        { label: 'Playboys', value: '530' },
+        { label: 'Playful Protagonist', value: '531' },
+        { label: 'Poetry', value: '532' },
+        { label: 'Poisons', value: '533' },
+        { label: 'Pokemon', value: '771' },
+        { label: 'Police', value: '534' },
+        { label: 'Polite Protagonist', value: '535' },
+        { label: 'Politics', value: '536' },
+        { label: 'Polyandry', value: '537' },
+        { label: 'Polygamy', value: '538' },
+        { label: 'Poor Protagonist', value: '539' },
+        { label: 'Poor to Rich', value: '540' },
+        { label: 'Popular Love Interests', value: '541' },
+        { label: 'Possession', value: '542' },
+        { label: 'Possessive Characters', value: '543' },
+        { label: 'Post-apocalyptic', value: '544' },
+        { label: 'Power Couple', value: '545' },
+        { label: 'Power Struggle', value: '546' },
+        { label: 'Pragmatic Protagonist', value: '547' },
+        { label: 'Precognition', value: '548' },
+        { label: 'Pregnancy', value: '549' },
+        { label: 'Pretend Lovers', value: '550' },
+        { label: 'Previous Life Talent', value: '551' },
+        { label: 'Priestesses', value: '552' },
+        { label: 'Priests', value: '553' },
+        { label: 'Prison', value: '554' },
+        { label: 'Proactive Protagonist', value: '555' },
+        { label: 'Proficiency', value: '793' },
+        { label: 'Programmer', value: '556' },
+        { label: 'Prophecies', value: '557' },
+        { label: 'Prostitutes', value: '558' },
+        { label: 'Protagonist Falls in Love First', value: '559' },
+        { label: 'Protagonist Strong from the Start', value: '560' },
+        { label: 'Protagonist with Multiple Bodies', value: '561' },
+        { label: 'Psychic Powers', value: '562' },
+        { label: 'Psychopaths', value: '563' },
+        { label: 'Puppeteers', value: '564' },
+        { label: 'Quiet Characters', value: '565' },
+        { label: 'Quirky Characters', value: '566' },
+        { label: 'R-15', value: '567' },
+        { label: 'R-18', value: '568' },
+        { label: 'Race Change', value: '569' },
+        { label: 'Racism', value: '570' },
+        { label: 'Rape', value: '571' },
+        { label: 'Rape Victim Becomes Lover', value: '572' },
+        { label: 'Reality-Game Fusion', value: '830' },
+        { label: 'Rebellion', value: '573' },
+        { label: 'Reborn', value: '829' },
+        { label: 'Reborn as the Villain', value: '831' },
+        { label: 'Reincarnated as a Monster', value: '574' },
+        { label: 'Reincarnated as an Object', value: '575' },
+        { label: 'Reincarnated in a Game World', value: '576' },
+        { label: 'Reincarnated in Another World', value: '577' },
+        { label: 'Reincarnation', value: '578' },
+        { label: 'Religions', value: '579' },
+        { label: 'Reluctant Protagonist', value: '580' },
+        { label: 'Reporters', value: '581' },
+        { label: 'Restaurant', value: '582' },
+        { label: 'Resurrection', value: '583' },
+        { label: 'Returning from Another World', value: '584' },
+        { label: 'Revenge', value: '585' },
+        { label: 'Reverse Harem', value: '586' },
+        { label: 'Reverse Rape', value: '587' },
+        { label: 'Reversible Couple', value: '588' },
+        { label: 'Rich to Poor', value: '589' },
+        { label: 'Righteous Protagonist', value: '590' },
+        { label: 'Rivalry', value: '591' },
+        { label: 'Romantic Subplot', value: '592' },
+        { label: 'Roommates', value: '593' },
+        { label: 'Royalty', value: '594' },
+        { label: 'Ruthless Protagonist', value: '595' },
+        { label: 'Sadistic Characters', value: '596' },
+        { label: 'Saints', value: '597' },
+        { label: 'Salaryman', value: '598' },
+        { label: 'Samurai', value: '599' },
+        { label: 'Saving the World', value: '600' },
+        { label: 'Schemes And Conspiracies', value: '601' },
+        { label: 'Schizophrenia', value: '602' },
+        { label: 'Scientists', value: '603' },
+        { label: 'Sculptors', value: '604' },
+        { label: 'Sealed Power', value: '605' },
+        { label: 'Second Chance', value: '606' },
+        { label: 'Secret Crush', value: '607' },
+        { label: 'Secret Identity', value: '608' },
+        { label: 'Secret Organizations', value: '609' },
+        { label: 'Secret Relationship', value: '610' },
+        { label: 'Secretive Protagonist', value: '611' },
+        { label: 'Secrets', value: '612' },
+        { label: 'Sect Development', value: '613' },
+        { label: 'Seduction', value: '614' },
+        { label: "Seeing Things Other Humans Can't", value: '615' },
+        { label: 'Selfish Protagonist', value: '616' },
+        { label: 'Selfless Protagonist', value: '617' },
+        { label: 'Seme Protagonist', value: '618' },
+        { label: 'Senpai-Kouhai Relationship', value: '619' },
+        { label: 'Sentient Objects', value: '620' },
+        { label: 'Sentimental Protagonist', value: '621' },
+        { label: 'Serial Killers', value: '622' },
+        { label: 'Servants', value: '623' },
+        { label: 'Seven Deadly Sins', value: '624' },
+        { label: 'Seven Virtues', value: '625' },
+        { label: 'Sex Friends', value: '626' },
+        { label: 'Sex Slaves', value: '627' },
+        { label: 'Sexual Abuse', value: '628' },
+        { label: 'Sexual Cultivation Technique', value: '629' },
+        { label: 'Shameless Protagonist', value: '630' },
+        { label: 'Shapeshifters', value: '631' },
+        { label: 'Sharing A Body', value: '632' },
+        { label: 'Sharp-tongued Characters', value: '633' },
+        { label: 'Shield User', value: '634' },
+        { label: 'Shikigami', value: '635' },
+        { label: 'Short Story', value: '636' },
+        { label: 'Shota', value: '637' },
+        { label: 'Shoujo-Ai Subplot', value: '638' },
+        { label: 'Shounen-Ai Subplot', value: '639' },
+        { label: 'Showbiz', value: '640' },
+        { label: 'Shy Characters', value: '641' },
+        { label: 'Sibling Rivalry', value: '642' },
+        { label: "Sibling's Care", value: '643' },
+        { label: 'Siblings', value: '644' },
+        { label: 'Siblings Not Related by Blood', value: '645' },
+        { label: 'Sickly Characters', value: '646' },
+        { label: 'Sign In', value: '811' },
+        { label: 'Sign Language', value: '647' },
+        { label: 'Siheyuan', value: '820' },
+        { label: 'Simulator', value: '786' },
+        { label: 'Singers', value: '648' },
+        { label: 'Single Female Lead', value: '787' },
+        { label: 'Single Parent', value: '649' },
+        { label: 'Sister Complex', value: '650' },
+        { label: 'Skill Assimilation', value: '651' },
+        { label: 'Skill Books', value: '652' },
+        { label: 'Skill Creation', value: '653' },
+        { label: 'Slave Harem', value: '654' },
+        { label: 'Slave Protagonist', value: '655' },
+        { label: 'Slaves', value: '656' },
+        { label: 'Sleeping', value: '657' },
+        { label: 'Slow Growth at Start', value: '658' },
+        { label: 'Slow Romance', value: '659' },
+        { label: 'Smart Couple', value: '660' },
+        { label: 'Social Outcasts', value: '661' },
+        { label: 'Soldiers', value: '662' },
+        { label: 'Soul Power', value: '663' },
+        { label: 'Souls', value: '664' },
+        { label: 'Spatial Manipulation', value: '665' },
+        { label: 'Spear Wielder', value: '666' },
+        { label: 'Special Abilities', value: '667' },
+        { label: 'Spies', value: '668' },
+        { label: 'Spirit Advisor', value: '669' },
+        { label: 'Spirit Users', value: '670' },
+        { label: 'Spirits', value: '671' },
+        { label: 'Spiritual Energy Revival', value: '828' },
+        { label: 'Stalkers', value: '672' },
+        { label: 'Star Wars', value: '817' },
+        { label: 'Stockholm Syndrome', value: '673' },
+        { label: 'Stoic Characters', value: '674' },
+        { label: 'Store Owner', value: '675' },
+        { label: 'Straight Seme', value: '676' },
+        { label: 'Straight Uke', value: '677' },
+        { label: 'Strategic Battles', value: '678' },
+        { label: 'Strategist', value: '679' },
+        { label: 'Strength-based Social Hierarchy', value: '680' },
+        { label: 'Strong Love Interests', value: '681' },
+        { label: 'Strong to Stronger', value: '682' },
+        { label: 'Stubborn Protagonist', value: '683' },
+        { label: 'Student Council', value: '684' },
+        { label: 'Student-Teacher Relationship', value: '685' },
+        { label: 'Succubus', value: '686' },
+        { label: 'Sudden Strength Gain', value: '687' },
+        { label: 'Sudden Wealth', value: '688' },
+        { label: 'Suicides', value: '689' },
+        { label: 'Summoned Hero', value: '690' },
+        { label: 'Summoning Magic', value: '691' },
+        { label: 'Survival', value: '692' },
+        { label: 'Survival Game', value: '693' },
+        { label: 'Swallowed Star', value: '785' },
+        { label: 'Sword And Magic', value: '694' },
+        { label: 'Sword Wielder', value: '695' },
+        { label: 'System', value: '696' },
+        { label: 'Teachers', value: '697' },
+        { label: 'Teamwork', value: '698' },
+        { label: 'Technological Gap', value: '699' },
+        { label: 'Tentacles', value: '700' },
+        { label: 'Terminal Illness', value: '701' },
+        { label: 'Territory Management', value: '802' },
+        { label: 'Terrorists', value: '702' },
+        { label: 'Thieves', value: '703' },
+        { label: 'Three Kingdoms', value: '795' },
+        { label: 'Threesome', value: '704' },
+        { label: 'Thriller', value: '705' },
+        { label: 'Time Loop', value: '706' },
+        { label: 'Time Manipulation', value: '707' },
+        { label: 'Time Paradox', value: '708' },
+        { label: 'Time Skip', value: '709' },
+        { label: 'Time Travel', value: '710' },
+        { label: 'Timid Protagonist', value: '711' },
+        { label: 'Tomboyish Female Lead', value: '712' },
+        { label: 'Torture', value: '713' },
+        { label: 'Toys', value: '714' },
+        { label: 'Tragic Past', value: '715' },
+        { label: 'Transformation Ability', value: '716' },
+        { label: 'Transmigration', value: '717' },
+        { label: 'Transplanted Memories', value: '718' },
+        { label: 'Transported into a Game World', value: '719' },
+        { label: 'Transported Modern Structure', value: '720' },
+        { label: 'Transported to Another World', value: '721' },
+        { label: 'Trap', value: '722' },
+        { label: 'Tribal Society', value: '723' },
+        { label: 'Trickster', value: '724' },
+        { label: 'Tsundere', value: '725' },
+        { label: 'Twins', value: '726' },
+        { label: 'Twisted Personality', value: '727' },
+        { label: 'Ugly Protagonist', value: '728' },
+        { label: 'Ugly to Beautiful', value: '729' },
+        { label: 'Unconditional Love', value: '730' },
+        { label: 'Undead Protagonist', value: '810' },
+        { label: 'Underestimated Protagonist', value: '731' },
+        { label: 'Unique Cultivation Technique', value: '732' },
+        { label: 'Unique Weapon User', value: '733' },
+        { label: 'Unique Weapons', value: '734' },
+        { label: 'Unlimited Flow', value: '735' },
+        { label: 'Unlucky Protagonist', value: '736' },
+        { label: 'Unreliable Narrator', value: '737' },
+        { label: 'Unrequited Love', value: '738' },
+        { label: 'Valkyries', value: '739' },
+        { label: 'Vampires', value: '740' },
+        { label: 'Villainess Noble Girls', value: '741' },
+        { label: 'Virtual Reality', value: '742' },
+        { label: 'Vocaloid', value: '743' },
+        { label: 'Voice Actors', value: '744' },
+        { label: 'Voyeurism', value: '745' },
+        { label: 'Waiters', value: '746' },
+        { label: 'War Records', value: '747' },
+        { label: 'Warhammer', value: '775' },
+        { label: 'Wars', value: '748' },
+        { label: 'Weak Protagonist', value: '749' },
+        { label: 'Weak to Strong', value: '750' },
+        { label: 'Wealthy Characters', value: '751' },
+        { label: 'Werebeasts', value: '752' },
+        { label: 'Western Names', value: '788' },
+        { label: 'Wishes', value: '753' },
+        { label: 'Witcher', value: '819' },
+        { label: 'Witches', value: '754' },
+        { label: 'Wizards', value: '755' },
+        { label: 'World Hopping', value: '756' },
+        { label: 'World Travel', value: '757' },
+        { label: 'World Tree', value: '758' },
+        { label: 'Writers', value: '759' },
+        { label: 'Yandere', value: '760' },
+        { label: 'Youkai', value: '761' },
+        { label: 'Younger Brothers', value: '762' },
+        { label: 'Younger Love Interests', value: '763' },
+        { label: 'Younger Sisters', value: '764' },
+        { label: 'Yu-Gi-Oh!', value: '774' },
+        { label: 'Zombies', value: '765' },
+      ],
+    },
+
+    folders: {
+      value: '',
+      label: 'Library Folders',
+      options: [
+        { label: 'No Filter', value: '' },
+        { label: 'Reading', value: '1' },
+        { label: 'Read Later', value: '2' },
+        { label: 'Completed', value: '3' },
+        { label: 'Trash', value: '5' },
+      ],
+      type: FilterTypes.Picker,
+    },
+    library_exclude: {
+      value: '',
+      label: 'Library Exclude',
+      options: [
+        { label: 'None', value: '' },
+        { label: 'Exclude All', value: 'history' },
+        { label: 'Exclude Trash', value: 'trash' },
+        { label: 'Exclude Library & Trash', value: 'in_library' },
+      ],
+      type: FilterTypes.Picker,
+    },
+  } satisfies Filters;
+}
+
+export default new WTRLabCleanPlugin();
